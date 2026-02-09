@@ -138,7 +138,8 @@ def extract_text(raw: RawInput, max_chars: int = 50_000, timeout_s: int = 20) ->
     raise ValueError(f"Unsupported source_type: {raw.source_type}")
 from src.data_processor import RawInput, extract_text
 
-sample = """Welcome to the Ironhack Mindfulness Podcast.
+if __name__ == "__main__":
+    sample = """Welcome to the Ironhack Mindfulness Podcast.
 Let's begin.
 
 Find a comfortable position and gently close your eyes.
@@ -151,11 +152,44 @@ Take a deep breath in... and out.
 Thank you for being here today.
 """
 
-raw = RawInput(source_type="text", text=sample)
-out = extract_text(raw)
+    raw = RawInput(source_type="text", text=sample)
+    out = extract_text(raw)
 
-print("SOURCE:", out.source_type)
-print("META:", out.meta)
-print("\n--- CHUNKS ---")
-for k, v in out.chunks.items():
-    print(f"\n[{k.upper()}]\n{v}\n")
+    print("✅ Test ran")
+    print("SOURCE:", out.source_type)
+    print("META:", out.meta)
+
+    print("\n--- CHUNKS ---")
+    for k, v in out.chunks.items():
+        print(f"\n[{k.upper()}]\n{v}\n")
+    
+
+from pathlib import Path
+
+def load_meditation_chunks_from_folder(input_folder: str = "1. Input") -> Dict[ChunkKey, str]:
+    """
+    Loads your existing script files from the folder:
+    - Script Intro
+    - Script Opening
+    - Script Affirmations
+    - Script Closing
+    and returns them as chunks.
+    """
+    folder = Path(input_folder)
+
+    intro_path = folder / "Script Intro"
+    opening_path = folder / "Script Opening"
+    meditation_path = folder / "Script Affirmations"
+    closure_path = folder / "Script Closing"
+
+    intro = intro_path.read_text(encoding="utf-8") if intro_path.exists() else ""
+    opening = opening_path.read_text(encoding="utf-8") if opening_path.exists() else ""
+    meditation = meditation_path.read_text(encoding="utf-8") if meditation_path.exists() else ""
+    closure = closure_path.read_text(encoding="utf-8") if closure_path.exists() else ""
+
+    return {
+        "intro": _clean_text(intro),
+        "opening": _clean_text(opening),
+        "meditation": _clean_text(meditation),
+        "closure": _clean_text(closure),
+    }
