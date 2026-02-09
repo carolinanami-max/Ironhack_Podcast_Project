@@ -1,0 +1,113 @@
+rom __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Literal
+import re
+
+import requests
+
+
+
+SourceType = Literal["text", "pdf", "url"]
+
+
+
+@dataclass
+class RawInput:
+    """
+    Standard input object used across the pipeline.
+    Exactly one of (text, pdf_path, url) should be provided depending on source_type.
+    """
+    source_type: SourceType
+    text: Optional[str] = None
+    pdf_path: Optional[str] = None
+    url: Optional[str] = None
+
+
+
+@dataclass
+class ExtractedContent:
+    """
+    Output of the data processing step.
+    """
+    source_type: SourceType
+    content: str
+    meta: dict
+
+
+
+def _clean_text(text: str) -> str:
+    """Basic cleanup: normalize whitespace and remove repeated blank lines."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)                 # collapse spaces/tabs
+    text = re.sub(r"\n{3,}", "\n\n", text)              # collapse many newlines
+    return text.strip()
+
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    """Hard cap to keep downstream LLM calls safe."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n\n[TRUNCATED]"
+
+
+
+def extract_text(raw: RawInput, max_chars: int = 50_000, timeout_s: int = 20) -> ExtractedContent:
+    """
+    Extract plain text from one of the supported sources:
+    - text: user pasted script/notes
+    - url: fetch HTML (MVP: raw HTML text; later you can parse with BeautifulSoup)
+    - pdf: extract text from PDF with pypdf
+
+    Returns ExtractedContent(content=...) ready for LLM processing.
+    """
+    if raw.source_type == "text":
+        if not raw.text or not raw.text.strip():
+            raise ValueError("No text provided. Please paste a script or notes.")
+        cleaned = _clean_text(raw.text)
+        cleaned = _truncate(cleaned, max_chars)
+        return ExtractedContent(source_type="text", content=cleaned, meta={"length": len(cleaned)})
+
+    if raw.source_type == "url":
+        if not raw.url or not raw.url.strip():
+            raise ValueError("No URL provided. Please paste a valid article URL.")
+        url = raw.url.strip()
+
+        headers = {"User-Agent": "Ironhack-Podcast-Studio/1.0"}
+        resp = requests.get(url, headers=headers, timeout=timeout_s)
+        resp.raise_for_status()
+
+        # MVP approach: return raw page text (often HTML). Good enough to prove the pipeline.
+        # Enhancement: parse main article text with BeautifulSoup/readability later.
+        page_text = resp.text
+        cleaned = _clean_text(page_text)
+        cleaned = _truncate(cleaned, max_chars)
+        return ExtractedContent(source_type="url", content=cleaned, meta={"url": url, "length": len(cleaned)})
+
+    if raw.source_type == "pdf":
+        if not raw.pdf_path or not raw.pdf_path.strip():
+            raise ValueError("No PDF file provided. Please upload a PDF.")
+        pdf_path = raw.pdf_path.strip()
+
+        try:
+            from pypdf import PdfReader
+        except ImportError as e:
+            raise ImportError(
+                "Missing PDF dependency. Install with: pip install pypdf"
+            ) from e
+
+        reader = PdfReader(pdf_path)
+        pages_text = []
+        for i, page in enumerate(reader.pages):
+            pages_text.append(page.extract_text() or "")
+        joined = "\n".join(pages_text)
+
+        cleaned = _clean_text(joined)
+        if not cleaned:
+            raise ValueError("This PDF has no extractable text (may be scanned image).")
+
+        cleaned = _truncate(cleaned, max_chars)
+        return ExtractedContent(source_type="pdf", content=cleaned, meta={"pdf_path": pdf_path, "length": len(cleaned)})
+
+    raise ValueError(f"Unsupported source_type: {raw.source_type}")
