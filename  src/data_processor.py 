@@ -1,23 +1,17 @@
-rom __future__ import annotations
+from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Optional, Literal, Dict
 import re
-
 import requests
 
-
-
 SourceType = Literal["text", "pdf", "url"]
+ChunkKey = Literal["intro", "opening", "meditation", "closure"]
 
 
 
 @dataclass
 class RawInput:
-    """
-    Standard input object used across the pipeline.
-    Exactly one of (text, pdf_path, url) should be provided depending on source_type.
-    """
     source_type: SourceType
     text: Optional[str] = None
     pdf_path: Optional[str] = None
@@ -27,87 +21,141 @@ class RawInput:
 
 @dataclass
 class ExtractedContent:
-    """
-    Output of the data processing step.
-    """
     source_type: SourceType
-    content: str
+    content: str                 # full cleaned text
+    chunks: Dict[ChunkKey, str]  # structured sections
     meta: dict
 
 
 
 def _clean_text(text: str) -> str:
-    """Basic cleanup: normalize whitespace and remove repeated blank lines."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)                 # collapse spaces/tabs
-    text = re.sub(r"\n{3,}", "\n\n", text)              # collapse many newlines
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
 
 def _truncate(text: str, max_chars: int) -> str:
-    """Hard cap to keep downstream LLM calls safe."""
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "\n\n[TRUNCATED]"
 
 
 
-def extract_text(raw: RawInput, max_chars: int = 50_000, timeout_s: int = 20) -> ExtractedContent:
+def _chunk_meditation(text: str) -> Dict[ChunkKey, str]:
     """
-    Extract plain text from one of the supported sources:
-    - text: user pasted script/notes
-    - url: fetch HTML (MVP: raw HTML text; later you can parse with BeautifulSoup)
-    - pdf: extract text from PDF with pypdf
+    Simple heuristic chunker for your specific meditation format.
+    If it can’t confidently find boundaries, it falls back safely.
+    """
+    t = text.strip()
 
-    Returns ExtractedContent(content=...) ready for LLM processing.
-    """
+    # Heuristic anchors (tweak these to match your script wording)
+    intro_end = t.find("Let's begin.")
+    opening_start = intro_end + len("Let's begin.") if intro_end != -1 else 0
+
+    # Opening typically begins with “Find a comfortable position…”
+    opening_anchor = t.find("Find a comfortable position")
+    if opening_anchor != -1:
+        opening_start = opening_anchor
+
+    # Meditation typically starts at the first “I am …” affirmation
+    meditation_start = t.find("I am ")
+    if meditation_start == -1:
+        meditation_start = t.find("I’m ")  # fallback (rare)
+
+    # Closure anchor
+    closure_start = t.find("Take a deep breath")
+    if closure_start == -1:
+        closure_start = t.find("Thank you for being here")
+
+    # Build chunks with safe fallbacks
+    intro = t[:opening_start].strip() if opening_start > 0 else ""
+    opening = ""
+    meditation = ""
+    closure = ""
+
+    if meditation_start != -1:
+        opening = t[opening_start:meditation_start].strip()
+    else:
+        opening = t[opening_start:].strip()
+
+    if meditation_start != -1 and closure_start != -1 and closure_start > meditation_start:
+        meditation = t[meditation_start:closure_start].strip()
+        closure = t[closure_start:].strip()
+    elif meditation_start != -1:
+        meditation = t[meditation_start:].strip()
+    else:
+        # If we can’t find affirmations, treat everything after intro/opening as meditation
+        meditation = t[opening_start:].strip()
+
+    return {
+        "intro": intro,
+        "opening": opening,
+        "meditation": meditation,
+        "closure": closure,
+    }
+
+
+
+def extract_text(raw: RawInput, max_chars: int = 50_000, timeout_s: int = 20) -> ExtractedContent:
     if raw.source_type == "text":
         if not raw.text or not raw.text.strip():
             raise ValueError("No text provided. Please paste a script or notes.")
-        cleaned = _clean_text(raw.text)
-        cleaned = _truncate(cleaned, max_chars)
-        return ExtractedContent(source_type="text", content=cleaned, meta={"length": len(cleaned)})
+        cleaned = _truncate(_clean_text(raw.text), max_chars)
+        chunks = _chunk_meditation(cleaned)
+        return ExtractedContent("text", cleaned, chunks, {"length": len(cleaned)})
 
     if raw.source_type == "url":
         if not raw.url or not raw.url.strip():
             raise ValueError("No URL provided. Please paste a valid article URL.")
         url = raw.url.strip()
-
         headers = {"User-Agent": "Ironhack-Podcast-Studio/1.0"}
         resp = requests.get(url, headers=headers, timeout=timeout_s)
         resp.raise_for_status()
 
-        # MVP approach: return raw page text (often HTML). Good enough to prove the pipeline.
-        # Enhancement: parse main article text with BeautifulSoup/readability later.
-        page_text = resp.text
-        cleaned = _clean_text(page_text)
-        cleaned = _truncate(cleaned, max_chars)
-        return ExtractedContent(source_type="url", content=cleaned, meta={"url": url, "length": len(cleaned)})
+        cleaned = _truncate(_clean_text(resp.text), max_chars)
+        chunks = _chunk_meditation(cleaned)
+        return ExtractedContent("url", cleaned, chunks, {"url": url, "length": len(cleaned)})
 
     if raw.source_type == "pdf":
         if not raw.pdf_path or not raw.pdf_path.strip():
             raise ValueError("No PDF file provided. Please upload a PDF.")
         pdf_path = raw.pdf_path.strip()
 
-        try:
-            from pypdf import PdfReader
-        except ImportError as e:
-            raise ImportError(
-                "Missing PDF dependency. Install with: pip install pypdf"
-            ) from e
-
+        from pypdf import PdfReader
         reader = PdfReader(pdf_path)
-        pages_text = []
-        for i, page in enumerate(reader.pages):
-            pages_text.append(page.extract_text() or "")
-        joined = "\n".join(pages_text)
+        joined = "\n".join((p.extract_text() or "") for p in reader.pages)
 
         cleaned = _clean_text(joined)
         if not cleaned:
             raise ValueError("This PDF has no extractable text (may be scanned image).")
 
         cleaned = _truncate(cleaned, max_chars)
-        return ExtractedContent(source_type="pdf", content=cleaned, meta={"pdf_path": pdf_path, "length": len(cleaned)})
+        chunks = _chunk_meditation(cleaned)
+        return ExtractedContent("pdf", cleaned, chunks, {"pdf_path": pdf_path, "length": len(cleaned)})
 
     raise ValueError(f"Unsupported source_type: {raw.source_type}")
+from src.data_processor import RawInput, extract_text
+
+sample = """Welcome to the Ironhack Mindfulness Podcast.
+Let's begin.
+
+Find a comfortable position and gently close your eyes.
+Bring your attention to your breath.
+
+I am strong in body, mind, and spirit.
+My intelligence grows with every experience I encounter.
+
+Take a deep breath in... and out.
+Thank you for being here today.
+"""
+
+raw = RawInput(source_type="text", text=sample)
+out = extract_text(raw)
+
+print("SOURCE:", out.source_type)
+print("META:", out.meta)
+print("\n--- CHUNKS ---")
+for k, v in out.chunks.items():
+    print(f"\n[{k.upper()}]\n{v}\n")
